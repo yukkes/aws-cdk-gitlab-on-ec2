@@ -1,0 +1,11 @@
+/node_modules
+/cdk.out
+/cdk.context.json
+/.env
+
+# TypeScript compiled files
+*.d.ts
+*.js
+
+# Keep jest config
+!jest.config.js
