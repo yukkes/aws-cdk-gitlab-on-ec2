@@ -3,8 +3,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
-import * as events from 'aws-cdk-lib/aws-events';
-import * as targets from 'aws-cdk-lib/aws-events-targets';
+import * as scheduler from 'aws-cdk-lib/aws-scheduler';
 import { Construct } from 'constructs';
 
 export class GitLabStack extends cdk.Stack {
@@ -273,52 +272,62 @@ export class GitLabStack extends cdk.Stack {
       description: 'GitLab EC2 Instance ID',
     });
 
-    // EventBridge rule to start instance at 8:00 AM JST (Monday to Friday)
-    const startRule = new events.Rule(this, 'GitLabStartRule', {
-      description: 'Start GitLab instance at 8:00 AM JST on weekdays',
-      schedule: events.Schedule.cron({
-        minute: '0',
-        hour: '23', // 8:00 AM JST = 23:00 UTC (previous day)
-        weekDay: 'SUN-THU' // Sunday-Thursday UTC = Monday-Friday JST
-      })
+    // Create IAM role for EventBridge Scheduler to manage EC2 instances
+    const schedulerRole = new iam.Role(this, 'SchedulerEC2Role', { // Renamed and updated principal
+      assumedBy: new iam.ServicePrincipal('scheduler.amazonaws.com'),
+      inlinePolicies: {
+        EC2StartStopPolicy: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              effect: iam.Effect.ALLOW,
+              actions: [
+                'ec2:StartInstances',
+                'ec2:StopInstances'
+              ],
+              resources: [`arn:aws:ec2:${this.region}:${this.account}:instance/${gitlabInstance.instanceId}`]
+            })
+          ]
+        })
+      }
     });
 
-    // EventBridge rule to stop instance at 10:00 PM JST (Monday to Friday)
-    const stopRule = new events.Rule(this, 'GitLabStopRule', {
-      description: 'Stop GitLab instance at 10:00 PM JST on weekdays',
-      schedule: events.Schedule.cron({
-        minute: '0',
-        hour: '13', // 10:00 PM JST = 13:00 UTC
-        weekDay: 'MON-FRI' // Monday-Friday UTC = Monday-Friday JST
-      })
+    // EventBridge Scheduler rule to start instance at 8:00 AM JST (Monday to Friday)
+    new scheduler.CfnSchedule(this, 'GitLabStartSchedule', {
+      name: 'GitLabStartInstanceSchedule',
+      description: 'Start GitLab instance at 8:00 AM JST on weekdays (23:00 UTC previous day, SUN-THU)',
+      scheduleExpression: 'cron(0 23 ? * SUN-THU *)',
+      scheduleExpressionTimezone: 'UTC', // Explicitly UTC as cron is set for UTC
+      flexibleTimeWindow: { mode: 'OFF' },
+      state: 'ENABLED',
+      target: {
+        arn: 'arn:aws:scheduler:::aws-sdk:ec2:startInstances',
+        roleArn: schedulerRole.roleArn,
+        input: JSON.stringify({ InstanceIds: [gitlabInstance.instanceId] }),
+        retryPolicy: {
+          maximumEventAgeInSeconds: 300, // Optional: 5 minutes
+          maximumRetryAttempts: 3,      // Optional: 3 retries
+        },
+      },
     });
 
-    // Add targets to the rules
-    startRule.addTarget(new targets.AwsApi({
-      service: 'EC2',
-      action: 'startInstances',
-      parameters: {
-        InstanceIds: [gitlabInstance.instanceId]
+    // EventBridge Scheduler rule to stop instance at 10:00 PM JST (Monday to Friday)
+    new scheduler.CfnSchedule(this, 'GitLabStopSchedule', {
+      name: 'GitLabStopInstanceSchedule',
+      description: 'Stop GitLab instance at 10:00 PM JST on weekdays (13:00 UTC, MON-FRI)',
+      scheduleExpression: 'cron(0 13 ? * MON-FRI *)',
+      scheduleExpressionTimezone: 'UTC', // Explicitly UTC as cron is set for UTC
+      flexibleTimeWindow: { mode: 'OFF' },
+      state: 'ENABLED',
+      target: {
+        arn: 'arn:aws:scheduler:::aws-sdk:ec2:stopInstances',
+        roleArn: schedulerRole.roleArn,
+        input: JSON.stringify({ InstanceIds: [gitlabInstance.instanceId] }),
+        retryPolicy: {
+          maximumEventAgeInSeconds: 300, // Optional: 5 minutes
+          maximumRetryAttempts: 3,      // Optional: 3 retries
+        },
       },
-      policyStatement: new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: ['ec2:StartInstances'],
-        resources: [`arn:aws:ec2:${this.region}:${this.account}:instance/${gitlabInstance.instanceId}`]
-      })
-    }));
-
-    stopRule.addTarget(new targets.AwsApi({
-      service: 'EC2',
-      action: 'stopInstances',
-      parameters: {
-        InstanceIds: [gitlabInstance.instanceId]
-      },
-      policyStatement: new iam.PolicyStatement({
-        effect: iam.Effect.ALLOW,
-        actions: ['ec2:StopInstances'],
-        resources: [`arn:aws:ec2:${this.region}:${this.account}:instance/${gitlabInstance.instanceId}`]
-      })
-    }));
+    });
 
     // Output schedule information
     new cdk.CfnOutput(this, 'InstanceSchedule', {
